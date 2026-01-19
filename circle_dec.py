@@ -25,6 +25,11 @@ sensor.set_auto_gain(False)
 sensor.set_auto_exposure(False)
 sensor.set_auto_whitebal(False)
 
+def log_iteration(cycle, dx, dy, conf):
+    data = {"c": cycle, "dx": dx, "dy": dy, "conf": conf}
+    with open(JSON_FILE, "a") as f:
+        f.write(json.dumps(data) + "\n")
+
 # Global variables to store the "Home" center point
 ref_cx = 0.0
 ref_cy = 0.0
