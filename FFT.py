@@ -114,7 +114,7 @@ for cycle in range(TOTAL_CYCLES):
 
     if len(dxs) < 3:
         log({"cycle": cycle, "status": "fail"})
-        print(f"[CYCLE {cycle}] ❌ insufficient displacement samples")
+        print(f"[CYCLE {cycle}]  insufficient displacement samples")
         continue
 
     # Robust statistics
@@ -150,7 +150,7 @@ for cycle in range(TOTAL_CYCLES):
 
     print(
         f"[{cycle:04d}] dx={dx_mm:.5f} dy={dy_mm:.5f} err={error_mm:.5f} "
-        f"σ={sigma_mm:.5f} conf={conf:.4f} {'✅' if precision_ok else '⚠️'}"
+        f"σ={sigma_mm:.5f} conf={conf:.4f} {'Precise' if precision_ok else 'Not Precise'}"
     )
 
 print("\n[INFO] Displacement monitoring complete.")
