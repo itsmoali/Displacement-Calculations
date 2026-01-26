@@ -1,112 +1,184 @@
 import sensor, image, time, json, math, pyb
 
-# --- CONFIG ---
+# ------------
+# CONFIGURATION
+# ------------
 MM_PER_PIXEL = 0.06
 JSON_FILE = "CIRCLE_TEST_PRO.json"
+
+# Number of total runs
 TOTAL_CYCLES = 1000
+# Samples per run
 SAMPLES_PER_CYCLE = 5
 
-# CIRCLE PARAMETERS
-R_MIN, R_MAX = 20, 100
+# Circle detection parameters (Change based on the marker being used)
+R_MIN = 20
+R_MAX = 100
 MAG_THRESHOLD = 2000
-ROI_PADDING = 40  # Extra space around the circle for the search window
+ROI_PADDING = 40  # pixels
 
+REFERENCE_SAMPLES = 20  # stable golden reference
+PIXEL_EPS = 1e-6
+
+# ------------
+# SENSOR SETUP 
+# ------------
 sensor.reset()
 sensor.set_pixformat(sensor.GRAYSCALE)
 sensor.set_framesize(sensor.VGA)
-sensor.skip_frames(time = 2000)
+sensor.skip_frames(time=2000)
+
 sensor.set_auto_gain(False)
 sensor.set_auto_exposure(False)
+sensor.set_auto_whitebal(False)
+# ------------
+# GPIO: Using Pin 0 (P0) as a Trigger Input
+# Robot will set this pin HIGH when it arrives at each measurement point
+trigger_pin = pyb.Pin("P0", pyb.Pin.IN, pyb.Pin.PULL_DOWN)
+# ------------
+# GLOBAL STATE
+# ------------
+ref_cx = 0.0
+ref_cy = 0.0
 
-# --- GLOBAL STATE ---
-ref_cx, ref_cy = 0.0, 0.0
-# Initialize ROI to full screen [x, y, w, h]
 search_roi = (0, 0, sensor.width(), sensor.height())
 
+# ------------
+# UTILITIES
+# ------------
+def clamp_roi(x, y, w, h):
+    x = max(0, x)
+    y = max(0, y)
+    w = min(w, sensor.width() - x)
+    h = min(h, sensor.height() - y)
+    return (x, y, w, h)
+
+# ------------
+# TWO-STAGE CIRCLE DETECTOR
+# ------------
 def find_target_circle(img):
     global search_roi
 
-    # 1. BLUR: Removes high-frequency noise that causes false edges
-    img.gaussian(1)
+    # Work on a copy to avoid cumulative blur
+    work = img.copy()
+    work.gaussian(1)
 
-    # 2. SEARCH: Only look inside the current ROI
-    circles = img.find_circles(threshold=MAG_THRESHOLD,
-                               roi=search_roi,
-                               x_stride=2, y_stride=2,
-                               r_min=R_MIN, r_max=R_MAX)
+    circles = work.find_circles(
+        threshold=MAG_THRESHOLD,
+        roi=search_roi,
+        x_stride=2,
+        y_stride=2,
+        r_min=R_MIN,
+        r_max=R_MAX
+    )
 
-    if circles:
-        # Get the strongest circle
-        target = max(circles, key=lambda c: c.magnitude())
-
-        # 3. UPDATE ROI: Center the next search window on this circle
-        new_x = target.x() - (target.r() + ROI_PADDING)
-        new_y = target.y() - (target.r() + ROI_PADDING)
-        new_size = (target.r() + ROI_PADDING) * 2
-
-        # Ensure ROI stays within camera bounds
-        search_roi = (max(0, int(new_x)),
-                      max(0, int(new_y)),
-                      min(sensor.width(), int(new_size)),
-                      min(sensor.height(), int(new_size)))
-        return target
-    else:
-        # 4. RESET ROI: If we lose the object, look at the whole screen next time
+    if not circles:
         search_roi = (0, 0, sensor.width(), sensor.height())
         return None
 
+    # Strongest + most circular (magnitude normalized by radius)
+    best = max(circles, key=lambda c: c.magnitude() / (c.r() + PIXEL_EPS))
+
+    # Update ROI deterministically
+    size = (best.r() + ROI_PADDING) * 2
+    new_x = int(best.x() - size // 2)
+    new_y = int(best.y() - size // 2)
+
+    search_roi = clamp_roi(new_x, new_y, int(size), int(size))
+
+    return best
+
+# ------------
+# GOLDEN REFERENCE 
+# ------------
 def capture_golden_reference():
     global ref_cx, ref_cy
-    print("Waiting for stable Golden Reference lock...")
 
-    while True:
+    print("Locking golden reference... hold steady")
+
+    xs, ys = [], []
+
+    while len(xs) < REFERENCE_SAMPLES:
         img = sensor.snapshot()
         target = find_target_circle(img)
 
         if target:
-            ref_cx, ref_cy = target.x(), target.y()
+            xs.append(target.x())
+            ys.append(target.y())
+
             img.draw_circle(target.x(), target.y(), target.r(), color=255)
-            print("Reference Locked! X:%0.1f, Y:%0.1f" % (ref_cx, ref_cy))
-            break
+            img.draw_cross(target.x(), target.y(), color=255)
         else:
-            print("Searching for object...")
-            time.sleep_ms(100)
+            xs.clear()
+            ys.clear()
 
-def log_iteration(cycle, dx, dy, conf):
-    data = {"c": cycle, "dx": dx, "dy": dy, "conf": conf}
+        time.sleep_ms(50)
+
+    ref_cx = sum(xs) / len(xs)
+    ref_cy = sum(ys) / len(ys)
+
+    print("Reference locked at X=%.3f Y=%.3f" % (ref_cx, ref_cy))
+
+# ------------
+# LOGGING (HIGH PRECISION)
+# ------------
+def log_iteration(cycle, dx, dy, sigma, conf):
+    entry = {
+        "cycle": cycle,
+        "dx_mm": round(dx, 4),
+        "dy_mm": round(dy, 4),
+        "sigma_mm": round(sigma, 5),
+        "confidence": conf
+    }
     with open(JSON_FILE, "a") as f:
-        f.write(json.dumps(data) + "\n")
+        f.write(json.dumps(entry) + "\n")
 
-# --- MAIN EXECUTION ---
-
+# ------------
+# MAIN
+# ------------
 capture_golden_reference()
-with open(JSON_FILE, "w") as f: f.write("") # Clear log
+
+with open(JSON_FILE, "w") as f:
+    f.write("")
 
 for cycle in range(TOTAL_CYCLES):
-    time.sleep(1) # Simulated trigger delay
+    # Wait for robot trigger
+    #wait_for_trigger() # Uncomment for hardware trigger
+    time.sleep(2)        # Manual delay for testing
 
-    found_count = 0
-    total_dx, total_dy = 0, 0
+    print("\n Taking Burst Images...")
 
-    print("Cycle %d: Processing..." % cycle)
+    dxs = []
+    dys = []
+
+    print("Cycle", cycle)
 
     for _ in range(SAMPLES_PER_CYCLE):
         img = sensor.snapshot()
         target = find_target_circle(img)
 
         if target:
-            total_dx += (target.x() - ref_cx)
-            total_dy += (target.y() - ref_cy)
-            found_count += 1
-            # Visual feedback on the OpenMV IDE frame buffer
+            dxs.append((target.x() - ref_cx) * MM_PER_PIXEL)
+            dys.append((target.y() - ref_cy) * MM_PER_PIXEL)
+
             img.draw_rectangle(search_roi, color=125)
             img.draw_cross(target.x(), target.y(), color=255)
 
-    if found_count > 0:
-        avg_dx = (total_dx / found_count) * MM_PER_PIXEL
-        avg_dy = (total_dy / found_count) * MM_PER_PIXEL
-        conf = found_count / SAMPLES_PER_CYCLE
-        log_iteration(cycle, round(avg_dx, 3), round(avg_dy, 3), conf)
-        print(" -> Detected. Shift: %0.3f, %0.3f" % (avg_dx, avg_dy))
+    if dxs:
+        mean_dx = sum(dxs) / len(dxs)
+        mean_dy = sum(dys) / len(dys)
+
+        # Combined positional sigma
+        var = sum((dx - mean_dx) ** 2 + (dy - mean_dy) ** 2
+                  for dx, dy in zip(dxs, dys)) / max(1, len(dxs) - 1)
+
+        sigma = math.sqrt(var)
+
+        conf = len(dxs) / SAMPLES_PER_CYCLE
+
+        log_iteration(cycle, mean_dx, mean_dy, sigma, conf)
+
+        print(" -> Δx=%.4fmm Δy=%.4fmm σ=%.5fmm conf=%.2f"
+              % (mean_dx, mean_dy, sigma, conf))
     else:
-        print(" -> FAILED (Object lost)")
+        print(" -> FAILED (marker lost)")
