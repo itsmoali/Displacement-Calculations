@@ -1,149 +1,180 @@
-import sensor, image, time, json, math, pyb
+import sensor, image, time, json, pyb, math
 
-# CONFIG
-MM_PER_PIXEL = 0.06  # Adjust based on setup
+# ------------
+# CONFIG (Change as needed)
+# ------------
+MM_PER_PIXEL = 0.06
 JSON_FILE = "BLOB_TEST.json"
+
+# Total number of runs
 TOTAL_CYCLES = 1000
-SAMPLES_PER_CYCLE = 5
-# Adjust based on the color of the target blob
+# Number of samples per run
+SAMPLES_PER_CYCLE = 7
+
+# Threshold values (change based on the color and size of the target blob)
 THRESHOLD = (150, 255)
+PIXELS_THRESHOLD = 300
+AREA_THRESHOLD = 300
 
-# GPIO: Using Pin 0 (P0) as a Trigger Input
-# Robot will set this pin HIGH when it arrives at each measurement point
-trigger_pin = pyb.Pin("P0", pyb.Pin.IN, pyb.Pin.PULL_DOWN)
+TARGET_PRECISION_MM = 0.01
 
+# ------------
+# Sensor Setup 
+# ------------
 sensor.reset()
 sensor.set_pixformat(sensor.GRAYSCALE)
-sensor.set_framesize(sensor.VGA)
-sensor.skip_frames(time = 2000)
+sensor.set_framesize(sensor.QVGA)
 
 sensor.set_auto_gain(False)
 sensor.set_auto_exposure(False)
 sensor.set_auto_whitebal(False)
 
-# Global variables to store the "Home" center point
+sensor.skip_frames(time=3000)
+
+# ------------
+# Globals
+# ------------
 ref_cx = 0.0
 ref_cy = 0.0
 
-# Pre-allocate buffer for images, so robot can do other stuff and not sitt still
-burst_buffers = []
-for i in range(SAMPLES_PER_CYCLE):
-    burst_buffers.append(sensor.alloc_extra_fb(sensor.width(), sensor.height(), sensor.GRAYSCALE))
+burst_buffers = [
+    sensor.alloc_extra_fb(sensor.width(), sensor.height(), sensor.GRAYSCALE)
+    for _ in range(SAMPLES_PER_CYCLE)
+]
 
-# Helper function to find the target blob
+# ------------
+# Blob + Subpixel Centroid
+# ------------
 def find_target_blob(img):
-    blobs = img.find_blobs([THRESHOLD], pixels_threshold=200, area_threshold=200, merge=True)
-    if blobs:
-        # Return the largest blob by pixel count
-        return max(blobs, key=lambda b: b.pixels())
-    return None
+    blobs = img.find_blobs(
+        [THRESHOLD],
+        pixels_threshold=PIXELS_THRESHOLD,
+        area_threshold=AREA_THRESHOLD,
+        merge=True
+    )
+    if not blobs:
+        return None
+    return max(blobs, key=lambda b: b.pixels())
 
-# Capture the golden reference position
+def refined_centroid(blob):
+    # second moment refinement (subpixel)
+    cx = blob.cx()
+    cy = blob.cy()
+
+    if blob.m00() > 0:
+        cx += blob.m10() / blob.m00() - cx
+        cy += blob.m01() / blob.m00() - cy
+
+    return cx, cy
+
+# ------------
+# Reference Capture
+# ------------
 def capture_golden_reference():
     global ref_cx, ref_cy
-    print("Capturing Golden Reference...")
 
-    # Take image and find blob
+    print("\n[REF] Capturing golden reference...")
     img = sensor.snapshot()
-    target = find_target_blob(img)
+    blob = find_target_blob(img)
 
-    # Draw for visial confirmation
-    if target:
-        ref_cx = target.cx()
-        ref_cy = target.cy()
-        img.draw_rectangle(target.rect())
-        img.draw_cross(int(ref_cx), int(ref_cy))
-        print("Reference Locked at Pixels: X:%0.1f, Y:%0.1f" % (ref_cx, ref_cy))
-    else:
-        print("ERROR: No blob found! Adjust your BLOB_THRESHOLD.")
+    if not blob:
+        raise RuntimeError("Reference blob not found")
 
-# Find average displacement over multiple samples
-def get_smoothed_displacement():
-    total_dx = 0
-    total_dy = 0
-    found_count = 0
+    ref_cx, ref_cy = refined_centroid(blob)
 
-    for _ in range(SAMPLES_PER_CYCLE):
-        img = sensor.snapshot()
-        target = find_target_blob(img)
+    print("[REF] Locked @ %.4f, %.4f px" % (ref_cx, ref_cy))
 
-        if target:
-            # Calculate pixel difference from the reference center
-            total_dx += (target.cx() - ref_cx)
-            total_dy += (target.cy() - ref_cy)
-            found_count += 1
+# ------------
+# Statistics
+# ------------
+def mean(vals):
+    return sum(vals) / len(vals)
 
-    if found_count == 0:
-        return None, None, 0.0 # Failed to find blob
+def variance(vals, mu):
+    return sum((v - mu) ** 2 for v in vals) / len(vals)
 
-    # Calculate average pixel shift and convert to mm
-    avg_dx_mm = (total_dx / found_count) * MM_PER_PIXEL
-    avg_dy_mm = (total_dy / found_count) * MM_PER_PIXEL
-    confidence = found_count / SAMPLES_PER_CYCLE
-    return round(avg_dx_mm, 3), round(avg_dy_mm, 3), round(confidence, 3)
+def trimmed_mean(vals, trim=1):
+    vals = sorted(vals)
+    return mean(vals[trim:-trim])
 
-def log_iteration(cycle, dx, dy, conf):
-    data = {"c": cycle, "dx": dx, "dy": dy, "conf": conf}
+# ------------
+# Logging
+# ------------
+def log(entry):
     with open(JSON_FILE, "a") as f:
-        f.write(json.dumps(data) + "\n")
+        f.write(json.dumps(entry) + "\n")
 
-def wait_for_trigger():
-    print("Waiting for Robot Signal on Pin P0...")
-    # Wait for pin to go HIGH (Robot arrives)
-    while trigger_pin.value() == 0:
-        # Sleep in meantime while pin is low
-        time.sleep_ms(10)
-
-    print("Signal Received!")
-
-    # Delay for stability
-    time.sleep_ms(50)
-
-# --- MAIN---
-
+# ------------
+# MAIN
+# ------------
 capture_golden_reference()
-time.sleep(2)
-# Clear the log file to start fresh
-with open(JSON_FILE, "w") as f: f.write("")
 
-# Main loop for total cycles
+with open(JSON_FILE, "w") as f:
+    f.write("")
+
+print("\n[INFO] Starting precision monitoring...\n")
+
 for cycle in range(TOTAL_CYCLES):
 
-    # Robot signal
-    # wait_for_trigger() # Uncomment for hardware trigger
-    time.sleep(2)        # Manual delay for testing
+    time.sleep(2)  # deterministic pause
 
-    # Capture N images into RAM buffers
-    print("\n Taking Burst Images...")
+    # Capture burst
     for buf in burst_buffers:
         buf.replace(sensor.snapshot())
 
-    print("Burst Complete!")
+    dxs = []
+    dys = []
 
-    # Background processing
-    total_dx = 0
-    total_dy = 0
-    found_count = 0
-
-    # Go through all images in buffer
     for buf in burst_buffers:
-        target = find_target_blob(buf)
-        if target:
-            total_dx += (target.cx() - ref_cx)
-            total_dy += (target.cy() - ref_cy)
-            found_count += 1
+        blob = find_target_blob(buf)
+        if blob:
+            cx, cy = refined_centroid(blob)
+            dxs.append(cx - ref_cx)
+            dys.append(cy - ref_cy)
 
-    # Calculate average displacement and log
-    if found_count > 0:
-        avg_dx_mm = (total_dx / found_count) * MM_PER_PIXEL
-        avg_dy_mm = (total_dy / found_count) * MM_PER_PIXEL
-        conf = found_count / SAMPLES_PER_CYCLE
+    if len(dxs) < 3:
+        log({"cycle": cycle, "status": "fail"})
+        print("[CYCLE %d] ❌ insufficient samples" % cycle)
+        continue
 
-        log_iteration(cycle, round(avg_dx_mm, 3), round(avg_dy_mm, 3), conf)
+    # Robust statistics
+    dx_px = trimmed_mean(dxs)
+    dy_px = trimmed_mean(dys)
 
-        print("Cycle %d: DX: %0.3f, DY: %0.3f (Based on %d samples)" %
-              (cycle, avg_dx_mm, avg_dy_mm, found_count))
-    else:
-        print("Cycle %d: FAILED - No blobs in burst" % cycle)
+    var_dx = variance(dxs, dx_px)
+    var_dy = variance(dys, dy_px)
 
-print("\nTest Complete.")
+    dx_mm = dx_px * MM_PER_PIXEL
+    dy_mm = dy_px * MM_PER_PIXEL
+
+    error_mm = math.sqrt(dx_mm**2 + dy_mm**2)
+    sigma_mm = math.sqrt(var_dx + var_dy) * MM_PER_PIXEL
+
+    precision_ok = error_mm <= TARGET_PRECISION_MM
+
+    entry = {
+        "cycle": cycle,
+        "dx_mm": round(dx_mm, 5),
+        "dy_mm": round(dy_mm, 5),
+        "error_mm": round(error_mm, 5),
+        "sigma_mm": round(sigma_mm, 5),
+        "samples": len(dxs),
+        "precision_ok": precision_ok,
+        "timestamp_ms": pyb.millis()
+    }
+
+    log(entry)
+
+    print(
+        "[%04d] dx=%.5f dy=%.5f err=%.5f σ=%.5f %s"
+        % (
+            cycle,
+            dx_mm,
+            dy_mm,
+            error_mm,
+            sigma_mm,
+            "Precise" if precision_ok else "Not Precise"
+        )
+    )
+
+print("\n[INFO] Monitoring complete.")
